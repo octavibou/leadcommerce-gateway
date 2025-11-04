@@ -87,8 +87,9 @@ const findFirst = (obj, key) => {
 };
 
 /* ---------- Axios GET con reintentos/backoff ---------- */
-async function axiosGetTxt(url) {
-  const MAX_TRIES = 3;
+async function axiosGetTxt(url, opts = {}) {
+  const MAX_TRIES = opts.retries ?? 3;
+  const REQ_TIMEOUT = opts.timeout ?? 45000;
   let lastErr = null;
   for (let i = 0; i < MAX_TRIES; i++) {
     try {
@@ -96,7 +97,7 @@ async function axiosGetTxt(url) {
         headers: CAT_HEADERS,
         responseType: "text",
         validateStatus: () => true,
-        timeout: 45000,
+        timeout: REQ_TIMEOUT,
         httpsAgent,
         httpAgent,
         maxContentLength: Infinity,
@@ -227,6 +228,8 @@ app.get("/catastro/full", async (req, res) => {
       prefer, rc14: rc14Param, debug,
     } = req.query;
 
+    const preferByCoords = String(prefer || "") === "bycoords";
+
     if (!lat || !lng)
       return res.status(400).json({ ok: false, error: "lat & lng required" });
 
@@ -236,21 +239,26 @@ app.get("/catastro/full", async (req, res) => {
 
     // DNPLOC → INE (opcional)
     let provincia_ine = null, municipio_ine = null;
-    if (provNorm && munNorm) {
-      try {
-        const dnploc = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPLOC");
-        dnploc.searchParams.set("Provincia", provNorm);
-        dnploc.searchParams.set("Municipio", munNorm);
-        const rLoc = await axiosGetTxt(dnploc.toString());
-        if (rLoc.status >= 200 && rLoc.status < 300 && typeof rLoc.data === "string") {
-          const obj = xmlParser.parse(rLoc.data);
-          const cp = findFirst(obj, "cp");
-          const cm = findFirst(obj, "cm");
-          if (cp) provincia_ine = normalizeProvinciaCode(cp);
-          if (cm) municipio_ine = String(cm).padStart(3, "0");
+    // Saltar DNPLOC si preferimos coords para acelerar
+    if (!preferByCoords) {
+      const provNorm = cleanProvinceName(province_name);
+      const munNorm  = cleanMunicipalityName(municipality_name);
+      if (provNorm && munNorm) {
+        try {
+          const dnploc = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPLOC");
+          dnploc.searchParams.set("Provincia", provNorm);
+          dnploc.searchParams.set("Municipio", munNorm);
+          const rLoc = await axiosGetTxt(dnploc.toString(), { timeout: 12000, retries: 1 });
+          if (rLoc.status >= 200 && rLoc.status < 300 && typeof rLoc.data === "string") {
+            const obj = xmlParser.parse(rLoc.data);
+            const cp = findFirst(obj, "cp");
+            const cm = findFirst(obj, "cm");
+            if (cp) provincia_ine = normalizeProvinciaCode(cp);
+            if (cm) municipio_ine = String(cm).padStart(3, "0");
+          }
+        } catch (err) {
+          console.warn("DNPLOC error:", err?.message || err);
         }
-      } catch (err) {
-        console.warn("DNPLOC error:", err?.message || err);
       }
     }
 
@@ -307,8 +315,24 @@ app.get("/catastro/full", async (req, res) => {
     // 1) Inicialización
     let rc14 = rc14Param || null, rccoorRawXml = null, obj1 = null, municipio = null, provincia = null, ldt = null;
 
+    if (!rc14 && preferByCoords) {
+      try {
+        const self = `${req.protocol}://${req.get("host")}`;
+        const byc = await axios.get(`${self}/catalog/v1/addresses/by-coords`, {
+          params: { lat, lng },
+          timeout: 15000
+        });
+        if (byc?.data?.ok && byc?.data?.rc14) {
+          rc14 = byc.data.rc14;
+          ldt = byc.data.label || ldt;
+        }
+      } catch (e) {
+        console.warn("[full] prefer=bycoords fast-path failed:", e?.message || e);
+      }
+    }
+
     // 2) PRIORIDAD: si llega rc14 → úsalo directo
-    if (!rc14) {
+    if (!rc14 && !preferByCoords) {
       // Dirección primero
       const adr = await tryRcFromAddress();
       if (adr.ok) {
@@ -383,28 +407,45 @@ app.get("/catastro/full", async (req, res) => {
     }
 
     // 5) DNPRC para datos ricos
-    const dnprcTry = async (prov, mun) => {
+    const provRccoor = provincia ? stripAccentsUpper(provincia) : null;
+    const munRccoor  = municipio ? stripAccentsUpper(municipio) : null;
+
+    let r2;
+    const tryDNPRC = async (prov, mun, to = 12000) => {
       const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC");
       url.searchParams.set("Provincia", prov ?? "");
       url.searchParams.set("Municipio", mun ?? "");
       url.searchParams.set("RC", refcat);
-      const r = await axiosGetTxt(url.toString());
-      if (r.status >= 200 && r.status < 300 && typeof r.data === "string") {
-        return { ok: true, xml: r.data, obj: xmlParser.parse(r.data) };
+      try {
+        const r = await axiosGetTxt(url.toString(), { timeout: to, retries: 1 });
+        if (r.status >= 200 && r.status < 300 && typeof r.data === "string") {
+          return { ok: true, xml: r.data, obj: xmlParser.parse(r.data) };
+        }
+      } catch (e) {
+        console.warn("[DNPRC] error:", e?.message || e);
       }
-      return { ok: false, status: r.status, data: r.data };
+      return { ok:false };
     };
 
-    const provRccoor = provincia ? stripAccentsUpper(provincia) : null;
-    const munRccoor  = municipio ? stripAccentsUpper(municipio) : null;
-
-    let r2 = await dnprcTry(cleanProvinceName(province_name), cleanMunicipalityName(municipality_name));
-    if (!r2.ok) r2 = await dnprcTry(provRccoor, munRccoor);
-    if (!r2.ok && ldt) {
-      const m = ldt.match(/\s+([A-ZÁÉÍÓÚÑ\s]+)\s+\(([A-ZÁÉÍÓÚÑ\s]+)\)\s*$/i);
-      if (m) r2 = await dnprcTry(stripAccentsUpper(m[2]), stripAccentsUpper(m[1]));
+    // Si venimos de coords, primero sin provincia/municipio para acelerar (muchas veces funciona)
+    if (preferByCoords) {
+      r2 = await tryDNPRC("", "", 12000);
+      if (!r2.ok) r2 = await tryDNPRC(provRccoor, munRccoor, 12000);
+      if (!r2.ok && ldt) {
+        const m = ldt?.match(/\s+([A-ZÁÉÍÓÚÑ\s]+)\s+\(([A-ZÁÉÍÓÚÑ\s]+)\)\s*$/i);
+        if (m) r2 = await tryDNPRC(stripAccentsUpper(m[2]), stripAccentsUpper(m[1]), 12000);
+      }
+      if (!r2.ok) r2 = await tryDNPRC(cleanProvinceName(province_name), cleanMunicipalityName(municipality_name), 12000);
+    } else {
+      // Camino normal (cuando no forzamos coords)
+      r2 = await tryDNPRC(cleanProvinceName(province_name), cleanMunicipalityName(municipality_name), 20000);
+      if (!r2.ok) r2 = await tryDNPRC(provRccoor, munRccoor, 20000);
+      if (!r2.ok && ldt) {
+        const m = ldt?.match(/\s+([A-ZÁÉÍÓÚÑ\s]+)\s+\(([A-ZÁÉÍÓÚÑ\s]+)\)\s*$/i);
+        if (m) r2 = await tryDNPRC(stripAccentsUpper(m[2]), stripAccentsUpper(m[1]), 20000);
+      }
+      if (!r2.ok) r2 = await tryDNPRC("", "", 20000);
     }
-    if (!r2.ok) r2 = await dnprcTry("", "");
 
     const provinciaOut = provincia || cleanProvinceName(province_name) || null;
     const municipioOut = municipio || cleanMunicipalityName(municipality_name) || null;
@@ -418,6 +459,24 @@ app.get("/catastro/full", async (req, res) => {
       municipio_ine: municipio_ine,
       ...(debug ? { debug: { ldt, sampleXml: rccoorRawXml ? rccoorRawXml.slice(0, 400) : null } } : {}),
     };
+
+    if (!r2?.ok && preferByCoords) {
+      // Devuelve rápido con lo esencial: refcat + label parsed desde ldt
+      let { via, numero } = addressFromLdt(ldt || "");
+      if (!via && street) via = String(street);
+      if (!numero && street_number && street_number !== "9999") numero = String(street_number);
+      if (numero === "9999") numero = null;
+
+      return res.json({
+        ...baseOut,
+        direccion: { tipo_via: null, via: via || null, numero: numero || null, cp: postal_code || null },
+        uso: null,
+        superficie_construida_m2: null,
+        anio_construccion: null,
+        note: "fast_return_no_dnprc",
+        ...(debug ? { debug: { reason: "prefer=bycoords fast path" } } : {}),
+      });
+    }
 
     if (r2.ok) {
       const o2 = r2.obj;
