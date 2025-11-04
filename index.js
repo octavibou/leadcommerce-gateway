@@ -697,24 +697,37 @@ app.get("/catalog/v1/addresses/:id/units", async (req, res) => {
     const html = r.data;
 
     // --- 2.2 Extraer todos los RC20 que existan en la página ---
-    // Los RC20 aparecen como anchors <a ...>XXXXXXXXXXXXXXX</a>
-    const rc20s = [];
-    const anchorRe = /&lt;a[^&gt;]*&gt;([0-9A-Z]{20})&lt;\/a&gt;/g;
-    let m;
-    while ((m = anchorRe.exec(html)) !== null) {
-      rc20s.push(m[1]);
-    }
-
-    // Fallback: si por lo que sea no capturamos anchors por entidades HTML, prueba sobre el HTML original sin escapar
-    if (rc20s.length === 0) {
-      const anchorRe2 = /<a[^>]*>([0-9A-Z]{20})<\/a>/g;
-      while ((m = anchorRe2.exec(html)) !== null) {
-        rc20s.push(m[1]);
+    // En algunos RC14 la lista no viene como anchors visibles; aparecen en texto,
+    // JS embebido o HTML con entidades. Extraemos cualquier token de 20 chars A-Z0-9
+    // y filtramos por los que empiezan por el RC14 (pc1+pc2).
+    function extractRc20s(htmlText, rc14Filter) {
+      const set = new Set();
+      const UPPER_RC14 = String(rc14Filter || "").toUpperCase();
+      const re = /[0-9A-Z]{20}/g;
+      let m;
+      while ((m = re.exec(htmlText)) !== null) {
+        const tok = m[0];
+        if (UPPER_RC14 && tok.startsWith(UPPER_RC14)) set.add(tok);
       }
+      return Array.from(set);
+    }
+
+    let rc20s = extractRc20s(html, rc14);
+
+    // Si no encontramos nada, probamos una URL alternativa más simple
+    if (rc20s.length === 0) {
+      const altUrl =
+        `https://www1.sedecatastro.gob.es/CYCBienInmueble/OVCListaBienes.aspx?RCCompleta=${rc14}`;
+      try {
+        const rAlt = await axiosGetTxt(altUrl, { timeout: 20000, retries: 1 });
+        if (rAlt.status >= 200 && rAlt.status < 300 && typeof rAlt.data === "string") {
+          rc20s = extractRc20s(rAlt.data, rc14);
+        }
+      } catch (_) { /* silencio */ }
     }
 
     if (rc20s.length === 0) {
-      return res.json({ ok:true, buildingId:id, units: [] });
+      return res.json({ ok: true, buildingId: id, units: [] });
     }
 
     // --- 2.3 Si no se pide enrich, devolvemos lista mínima (rápida) ---
