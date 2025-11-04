@@ -20,8 +20,8 @@ app.get("/health", (_req, res) => res.json({ ok: true, service: "gateway" }));
 app.get("/catastro/ping", (_req, res) => res.json({ ok: true, service: "catastro" }));
 
 /* -------------------- HTTP Agents + Headers -------------------- */
-const httpsAgent = new https.Agent({ keepAlive: false, timeout: 15000 });
-const httpAgent  = new http.Agent({  keepAlive: false, timeout: 15000 });
+const httpsAgent = new https.Agent({ keepAlive: false, timeout: 25000 });
+const httpAgent  = new http.Agent({  keepAlive: false, timeout: 25000 });
 
 const CAT_HEADERS = {
   Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
@@ -91,7 +91,7 @@ const axiosGetTxt = (url) =>
     headers: CAT_HEADERS,
     responseType: "text",
     validateStatus: () => true,
-    timeout: 15000,
+    timeout: 25000,
     httpsAgent,
     httpAgent,
   });
@@ -240,24 +240,29 @@ app.get("/catastro/full", async (req, res) => {
 
     // Helpers para resolución
     const tryRcFromCoords = async (LAT, LNG) => {
-      const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR");
-      url.searchParams.set("SRS", "EPSG:4326");
-      url.searchParams.set("Coordenada_X", String(LNG));
-      url.searchParams.set("Coordenada_Y", String(LAT));
-      const r = await axiosGetTxt(url.toString());
-      if (r.status >= 200 && r.status < 300 && typeof r.data === "string") {
-        const obj = xmlParser.parse(r.data);
-        const rc  = findFirst(obj, "rc");
-        const pc1 = findFirst(obj, "pc1");
-        const pc2 = findFirst(obj, "pc2");
-        return {
-          ok: !!(rc || (pc1 && pc2)),
-          rc14: rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null),
-          rawXml: r.data,
-          obj
-        };
+      try {
+        const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR");
+        url.searchParams.set("SRS", "EPSG:4326");
+        url.searchParams.set("Coordenada_X", String(LNG));
+        url.searchParams.set("Coordenada_Y", String(LAT));
+        const r = await axiosGetTxt(url.toString());
+        if (r.status >= 200 && r.status < 300 && typeof r.data === "string") {
+          const obj = xmlParser.parse(r.data);
+          const rc  = findFirst(obj, "rc");
+          const pc1 = findFirst(obj, "pc1");
+          const pc2 = findFirst(obj, "pc2");
+          return {
+            ok: !!(rc || (pc1 && pc2)),
+            rc14: rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null),
+            rawXml: r.data,
+            obj
+          };
+        }
+        return { ok: false, status: r.status };
+      } catch (err) {
+        console.warn("[tryRcFromCoords] error:", err?.message || err);
+        return { ok: false, error: String(err?.message || err) };
       }
-      return { ok: false };
     };
 
     const tryRcFromAddress = async () => {
@@ -322,6 +327,24 @@ app.get("/catastro/full", async (req, res) => {
         municipio = findFirst(obj1, "nm") || municipio;
         provincia = findFirst(obj1, "np") || provincia;
         ldt = findFirst(obj1, "ldt") || (rccoorRawXml?.match(/<ldt>([^<]+)<\/ldt>/i)?.[1]?.trim() || ldt);
+      }
+    }
+
+    // Internal fallback: reuse our own by-coords endpoint if direct calls failed
+    if (!rc14) {
+      try {
+        const self = `${req.protocol}://${req.get("host")}`;
+        const byc = await axios.get(`${self}/catalog/v1/addresses/by-coords`, {
+          params: { lat, lng },
+          timeout: 15000
+        });
+        if (byc?.data?.ok && byc?.data?.rc14) {
+          rc14 = byc.data.rc14;
+          // populate minimal context from that path
+          ldt = byc.data.label || ldt;
+        }
+      } catch (e) {
+        console.warn("[full] internal fallback /addresses/by-coords failed:", e?.message || e);
       }
     }
 
