@@ -200,7 +200,7 @@ app.get("/catastro/rc", async (req, res) => {
 });
 
 /* ==================================================================
-   /catastro/full → JSON enriquecido (con jitter + fallback por dirección)
+   /catastro/full → JSON enriquecido (PRIORIDAD DIRECCIÓN + fallback coords)
    ================================================================== */
 app.get("/catastro/full", async (req, res) => {
   try {
@@ -214,11 +214,11 @@ app.get("/catastro/full", async (req, res) => {
     if (!lat || !lng)
       return res.status(400).json({ ok: false, error: "lat & lng required" });
 
-    // Nombres normalizados (para DNPLOC/DNPRC)
+    // Nombres normalizados (para DNPLOC/DNPPPLOC/DNPRC)
     const provNorm = cleanProvinceName(province_name);
     const munNorm  = cleanMunicipalityName(municipality_name);
 
-    // 1) DNPLOC → INE
+    // 0) DNPLOC → INE (opcional)
     let provincia_ine = null, municipio_ine = null;
     if (provNorm && munNorm) {
       try {
@@ -238,7 +238,7 @@ app.get("/catastro/full", async (req, res) => {
       }
     }
 
-    // 2) Intento robusto para resolver RC: RCCOOR + jitter; si falla, DNPPPLOC por dirección
+    // Helpers para resolución
     const tryRcFromCoords = async (LAT, LNG) => {
       const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR");
       url.searchParams.set("SRS", "EPSG:4326");
@@ -260,52 +260,68 @@ app.get("/catastro/full", async (req, res) => {
       return { ok: false };
     };
 
-    const baseLat = Number(lat);
-    const baseLng = Number(lng);
-    const deltas = [
-      [0, 0],
-      [0.00025, 0],
-      [-0.00025, 0],
-      [0, 0.00025],
-      [0, -0.00025],
-    ];
-
-    let rc14 = null, rccoorRawXml = null, obj1 = null, municipio = null, provincia = null, ldt = null;
-    for (const [dlat, dlng] of deltas) {
-      const tr = await tryRcFromCoords(baseLat + dlat, baseLng + dlng);
-      if (tr.ok && tr.rc14) {
-        rc14 = tr.rc14;
-        rccoorRawXml = tr.rawXml;
-        obj1 = tr.obj;
-        break;
+    const tryRcFromAddress = async () => {
+      if (!(provNorm && munNorm && street && street_number)) return { ok:false };
+      // Usamos DNPPPLOC (Provincia, Municipio, NombreVia, Numero). TipoVia vacío para que haga matching laxa.
+      const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPPPLOC");
+      url.searchParams.set("Provincia", provNorm);
+      url.searchParams.set("Municipio", munNorm);
+      url.searchParams.set("TipoVia", ""); // si conoces "CL", "AV", etc., puedes colocarlo
+      url.searchParams.set("NombreVia", stripAccentsUpper(street));
+      url.searchParams.set("Numero", String(street_number));
+      const r = await axiosGetTxt(url.toString());
+      if (r.status >= 200 && r.status < 300 && typeof r.data === "string") {
+        const obj = xmlParser.parse(r.data);
+        const rc   = findFirst(obj, "rc");
+        const pc1  = findFirst(obj, "pc1");
+        const pc2  = findFirst(obj, "pc2");
+        const rc14 = rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null);
+        // Extra pistas desde DNPPPLOC
+        const municipio = findFirst(obj, "nm") || null;
+        const provincia = findFirst(obj, "np") || null;
+        const ldt = findFirst(obj, "ldt") || null;
+        return { ok: !!rc14, rc14, obj, rawXml: r.data, municipio, provincia, ldt };
       }
+      return { ok:false };
+    };
+
+    // 1) PRIORIDAD: dirección → RC
+    let rc14 = null, rccoorRawXml = null, obj1 = null, municipio = null, provincia = null, ldt = null;
+
+    const adr = await tryRcFromAddress();
+    if (adr.ok) {
+      rc14 = adr.rc14;
+      obj1 = adr.obj;
+      rccoorRawXml = adr.rawXml; // guardamos por simetría (aunque sea de DNPPPLOC)
+      municipio = adr.municipio || municipio;
+      provincia = adr.provincia || provincia;
+      ldt = adr.ldt || ldt;
     }
 
-    if (obj1) {
-      municipio = findFirst(obj1, "nm");
-      provincia = findFirst(obj1, "np");
-      ldt = findFirst(obj1, "ldt") || (rccoorRawXml.match(/<ldt>([^<]+)<\/ldt>/i)?.[1]?.trim() || null);
-    }
-
-    if (!rc14 && provNorm && munNorm && street && street_number) {
-      const dnppploc = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPPPLOC");
-      dnppploc.searchParams.set("Provincia", provNorm);
-      dnppploc.searchParams.set("Municipio", munNorm);
-      dnppploc.searchParams.set("TipoVia", ""); // si conoces "CL", "AV", etc., ponlo
-      dnppploc.searchParams.set("NombreVia", stripAccentsUpper(street));
-      dnppploc.searchParams.set("Numero", String(street_number));
-
-      const rAddr = await axiosGetTxt(dnppploc.toString());
-      if (rAddr.status >= 200 && rAddr.status < 300 && typeof rAddr.data === "string") {
-        const objA = xmlParser.parse(rAddr.data);
-        const rc   = findFirst(objA, "rc");
-        const pc1  = findFirst(objA, "pc1");
-        const pc2  = findFirst(objA, "pc2");
-        rc14 = rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null);
-
-        if (!municipio) municipio = findFirst(objA, "nm") || municipio;
-        if (!provincia) provincia = findFirst(objA, "np") || provincia;
-        if (!ldt) ldt = findFirst(objA, "ldt") || ldt;
+    // 2) Fallback: coords → RC (con pequeño jitter)
+    if (!rc14) {
+      const baseLat = Number(lat);
+      const baseLng = Number(lng);
+      const deltas = [
+        [0, 0],
+        [0.00025, 0],
+        [-0.00025, 0],
+        [0, 0.00025],
+        [0, -0.00025],
+      ];
+      for (const [dlat, dlng] of deltas) {
+        const tr = await tryRcFromCoords(baseLat + dlat, baseLng + dlng);
+        if (tr.ok && tr.rc14) {
+          rc14 = tr.rc14;
+          rccoorRawXml = tr.rawXml;
+          obj1 = tr.obj;
+          break;
+        }
+      }
+      if (obj1) {
+        municipio = findFirst(obj1, "nm") || municipio;
+        provincia = findFirst(obj1, "np") || provincia;
+        ldt = findFirst(obj1, "ldt") || (rccoorRawXml?.match(/<ldt>([^<]+)<\/ldt>/i)?.[1]?.trim() || ldt);
       }
     }
 
@@ -313,8 +329,8 @@ app.get("/catastro/full", async (req, res) => {
       return res.json({
         ok: true,
         status: "not_found",
-        step: "coords_to_rc",
-        ...(debug ? { debug: { rccoorSample: "no_rc_from_coords_and_addr" } } : {}),
+        step: "address_coords_to_rc",
+        ...(debug ? { debug: { sample: "no_rc_from_address_nor_coords" } } : {}),
       });
     }
 
@@ -323,7 +339,7 @@ app.get("/catastro/full", async (req, res) => {
     let refcat = refcatBase;
     if (refcatBase.length === 14 && street_number) {
       const unit = await pickUnitRCFromList(refcatBase, String(street_number));
-      if (unit) refcat = unit; // p.ej. 6681310DF4968S0001MQ
+      if (unit) refcat = unit;
     }
 
     // 3) DNPRC – cascade de intentos para datos ricos
@@ -360,7 +376,7 @@ app.get("/catastro/full", async (req, res) => {
       municipio: municipioOut,
       provincia_ine: provincia_ine,
       municipio_ine: municipio_ine,
-      ...(debug ? { debug: { ldt, rccoorSample: rccoorRawXml ? rccoorRawXml.slice(0, 400) : null } } : {}),
+      ...(debug ? { debug: { ldt, sampleXml: rccoorRawXml ? rccoorRawXml.slice(0, 400) : null } } : {}),
     };
 
     if (r2.ok) {
@@ -373,6 +389,7 @@ app.get("/catastro/full", async (req, res) => {
       const sfc     = toNum(findFirst(o2, "sfc"));
       const ant     = findFirst(o2, "ant");
 
+      // Rellenos suaves desde ldt/inputs
       if ((!via || !numero) && ldt) {
         const m = ldt.match(/^\s*(?:CL|AV|PS|PL|CR|CTRA|CM|RD|TRV|C\/|AV\.)?\s*([A-Z0-9ÁÉÍÓÚÑ\s]+?)\s+(\d+[A-Z]?)\b/i);
         if (m) {
@@ -386,7 +403,12 @@ app.get("/catastro/full", async (req, res) => {
 
       return res.json({
         ...baseOut,
-        direccion: { tipo_via: tipoVia || null, via: via || null, numero: numero || null, cp: cp || postal_code || null },
+        direccion: {
+          tipo_via: tipoVia || null,
+          via: via || null,
+          numero: numero || null,
+          cp: cp || postal_code || null
+        },
         uso: uso || null,
         superficie_construida_m2: sfc,
         anio_construccion: ant || null,
