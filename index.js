@@ -381,6 +381,81 @@ app.get("/catastro/full", async (req, res) => {
   }
 });
 
+/* ==================================================================
+   CAPA DE COMPATIBILIDAD (addresses/*)
+   ================================================================== */
+
+// Helpers compat
+const toRC14 = (rc) => (rc && rc.length >= 14 ? rc.slice(0,14) : null);
+const idBU = (rc14) => `ES.SDGC.BU.${rc14}`;
+const idAD = (rc14) => `ES.SDGC.AD.${rc14}`;
+
+// 1) Buscar “card” por coords
+app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
+  try {
+    const { lat, lng } = req.query;
+    if (!lat || !lng) return res.status(400).json({ ok:false, error:"lat & lng required" });
+
+    // Llamamos a /catastro/rc (XML)
+    const self = `${req.protocol}://${req.get("host")}`;
+    const r = await axios.get(`${self}/catastro/rc`, { params: { lat, lng }, responseType: "text", timeout: 15000 });
+
+    const xml = r.data;
+    const obj = xmlParser.parse(xml);
+    // Buscamos rc o, si no, pc1+pc2
+    const rc = findFirst(obj, "rc");
+    const pc1 = findFirst(obj, "pc1");
+    const pc2 = findFirst(obj, "pc2");
+    const rc14 = toRC14(rc || (pc1 && pc2 ? `${pc1}${pc2}` : null));
+
+    if (!rc14) return res.status(404).json({ ok:false, error:"no_rc_for_coords" });
+
+    const label = findFirst(obj, "ldire") || findFirst(obj, "ldt") || `Coords ${lat},${lng}`;
+
+    return res.json({
+      ok: true,
+      buildingId: idBU(rc14),
+      addressId: idAD(rc14),
+      rc14,
+      label,
+      photoUrl: null
+    });
+  } catch (e) {
+    console.error("[addresses/by-coords] error:", e?.message || e);
+    return res.status(502).json({ ok:false, error:"catastro_unreachable" });
+  }
+});
+
+// 2) Listado de unidades de un addressId/buildingId
+app.get("/catalog/v1/addresses/:id/units", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || !id.startsWith("ES.SDGC.BU.")) {
+      return res.status(400).json({ ok:false, error:"invalid_building_id" });
+    }
+    const rc14 = id.replace("ES.SDGC.BU.", "");
+    const self = `${req.protocol}://${req.get("host")}`;
+    const r = await axios.get(`${self}/catastro/building/${rc14}`, { timeout: 15000 });
+    return res.json({
+      ok: true,
+      buildingId: id,
+      units: r.data?.units || [],
+      meta: {
+        uso_principal: r.data?.units?.[0]?.uso_principal || null,
+        tipo: r.data?.units?.[0]?.tipo || null,
+      }
+    });
+  } catch (e) {
+    console.error("[addresses/:id/units] error:", e?.message || e);
+    return res.status(502).json({ ok:false, error:"building_unreachable" });
+  }
+});
+
+// 3) Foto del address (placeholder de momento)
+app.get("/catalog/v1/addresses/:id/photo", async (req, res) => {
+  return res.json({ ok:true, photoUrl: null });
+});
+
 /* -------------------- Start -------------------- */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`✅ Gateway listening on :${PORT}`));
