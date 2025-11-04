@@ -13,6 +13,10 @@ app.use(cors({
 
 // Health
 app.get("/health", (_req, res) => res.json({ ok: true, service: "gateway" }));
+app.get("/catastro/ping", (_req, res) =>
+  res.json({ ok: true, service: "catastro" })
+);
+
 
 // Endpoint base (mock de momento)
 app.get("/catastro/building/:rc", async (req, res) => {
