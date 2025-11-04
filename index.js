@@ -669,24 +669,126 @@ app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
   }
 });
 
-// 2) Listado de unidades de un addressId/buildingId
+// 2) Listado de unidades de un addressId/buildingId (real, con opción enrich)
 app.get("/catalog/v1/addresses/:id/units", async (req, res) => {
   try {
     const { id } = req.params;
+    const { enrich } = req.query;
+
     if (!id || !id.startsWith("ES.SDGC.BU.")) {
       return res.status(400).json({ ok:false, error:"invalid_building_id" });
     }
+
     const rc14 = id.replace("ES.SDGC.BU.", "");
-    const self = `${req.protocol}://${req.get("host")}`;
-    const r = await axios.get(`${self}/catastro/building/${rc14}`, { timeout: 15000 });
+
+    // --- 2.1 Descargar página de listado de bienes para esa parcela ---
+    const RC1 = rc14.slice(0, 7);
+    const RC2 = rc14.slice(7, 14);
+    const listUrl =
+      `https://www1.sedecatastro.gob.es/CYCBienInmueble/OVCListaBienes.aspx` +
+      `?RC1=${RC1}&RC2=${RC2}&RC3=&RC4=&esBice=&RCBice1=&RCBice2=&DenoBice=&pest=rc` +
+      `&final=&RCCompleta=${rc14}&from=OVCBusqueda&tipoCarto=nuevo`;
+
+    const r = await axiosGetTxt(listUrl, { timeout: 20000, retries: 2 });
+    if (!(r.status >= 200 && r.status < 300) || typeof r.data !== "string") {
+      return res.status(502).json({ ok:false, error:"catastro_bad_response", status:r.status });
+    }
+
+    const html = r.data;
+
+    // --- 2.2 Extraer todos los RC20 que existan en la página ---
+    // Los RC20 aparecen como anchors <a ...>XXXXXXXXXXXXXXX</a>
+    const rc20s = [];
+    const anchorRe = /&lt;a[^&gt;]*&gt;([0-9A-Z]{20})&lt;\/a&gt;/g;
+    let m;
+    while ((m = anchorRe.exec(html)) !== null) {
+      rc20s.push(m[1]);
+    }
+
+    // Fallback: si por lo que sea no capturamos anchors por entidades HTML, prueba sobre el HTML original sin escapar
+    if (rc20s.length === 0) {
+      const anchorRe2 = /<a[^>]*>([0-9A-Z]{20})<\/a>/g;
+      while ((m = anchorRe2.exec(html)) !== null) {
+        rc20s.push(m[1]);
+      }
+    }
+
+    if (rc20s.length === 0) {
+      return res.json({ ok:true, buildingId:id, units: [] });
+    }
+
+    // --- 2.3 Si no se pide enrich, devolvemos lista mínima (rápida) ---
+    const basicUnits = rc20s.map(rc20 => ({ rc20, etiqueta: null, uso:null, superficie_m2:null, anio:null }));
+    const doEnrich = String(enrich || "") === "1";
+
+    if (!doEnrich) {
+      return res.json({
+        ok: true,
+        buildingId: id,
+        units: basicUnits
+      });
+    }
+
+    // --- 2.4 Enriquecido por unidad vía DNPRC (best-effort, timeouts cortos) ---
+    // Para no bloquear demasiado, limitamos a 60 unidades como máximo.
+    const LIMIT = 60;
+    const slice = basicUnits.slice(0, LIMIT);
+
+    const enrichOne = async (u) => {
+      try {
+        const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC");
+        url.searchParams.set("Provincia", "");
+        url.searchParams.set("Municipio", "");
+        url.searchParams.set("RC", u.rc20);
+
+        const rr = await axiosGetTxt(url.toString(), { timeout: 8000, retries: 1 });
+        if (rr.status >= 200 && rr.status < 300 && typeof rr.data === "string") {
+          const o = xmlParser.parse(rr.data);
+
+          const tipoVia = findFirst(o, "tv");
+          let via       = findFirst(o, "nv");
+          let numero    = findFirst(o, "pnp");
+          const cp      = findFirst(o, "pc");
+          const uso     = findFirst(o, "luso") || findFirst(o, "uso");
+          const sfc     = toNum(findFirst(o, "sfc"));
+          const ant     = findFirst(o, "ant");
+
+          const etiqueta = [via, numero].filter(Boolean).join(" ");
+
+          return {
+            rc20: u.rc20,
+            etiqueta: etiqueta || null,
+            uso: uso || null,
+            superficie_m2: sfc || null,
+            anio: ant || null,
+            cp: cp || null
+          };
+        }
+      } catch (_) { /* silencio */ }
+      return { rc20: u.rc20, etiqueta: null, uso:null, superficie_m2:null, anio:null };
+    };
+
+    // Ejecutar enriquecido en paralelo con un límite de concurrencia pequeño
+    const concurrency = 5;
+    const out = [];
+    let i = 0;
+    async function runner() {
+      while (i < slice.length) {
+        const idx = i++;
+        out[idx] = await enrichOne(slice[idx]);
+      }
+    }
+    await Promise.all(Array.from({ length: concurrency }, runner));
+
+    // Si había más de LIMIT, añadimos el resto sin enriquecer
+    if (basicUnits.length > LIMIT) {
+      out.push(...basicUnits.slice(LIMIT));
+    }
+
     return res.json({
       ok: true,
       buildingId: id,
-      units: r.data?.units || [],
-      meta: {
-        uso_principal: r.data?.units?.[0]?.uso_principal || null,
-        tipo: r.data?.units?.[0]?.tipo || null,
-      }
+      units: out
     });
   } catch (e) {
     console.error("[addresses/:id/units] error:", e?.message || e);
