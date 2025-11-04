@@ -548,30 +548,120 @@ const idAD = (rc14) => `ES.SDGC.AD.${rc14}`;
 // 1) Buscar “card” por coords
 app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
   try {
-    const { lat, lng } = req.query;
+    const { lat, lng, enrich, street_number } = req.query;
     if (!lat || !lng) return res.status(400).json({ ok:false, error:"lat & lng required" });
 
+    // 1) Obtener RC14 rápido vía /catastro/rc
     const self = `${req.protocol}://${req.get("host")}`;
-    const r = await axios.get(`${self}/catastro/rc`, { params: { lat, lng }, responseType: "text", timeout: 20000 });
+    const r = await axios.get(`${self}/catastro/rc`, {
+      params: { lat, lng },
+      responseType: "text",
+      timeout: 20000
+    });
 
     const xml = r.data;
     const obj = xmlParser.parse(xml);
     const rc = findFirst(obj, "rc");
     const pc1 = findFirst(obj, "pc1");
     const pc2 = findFirst(obj, "pc2");
-    const rc14 = toRC14(rc || (pc1 && pc2 ? `${pc1}${pc2}` : null));
+    const rc14 = (rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null));
 
     if (!rc14) return res.status(404).json({ ok:false, error:"no_rc_for_coords" });
 
     const label = findFirst(obj, "ldire") || findFirst(obj, "ldt") || `Coords ${lat},${lng}`;
 
+    // 2) Si se aporta número de puerta y tenemos RC14 de parcela → intentar RC20 (unidad)
+    let refcat = rc14;
+    if (rc14 && rc14.length === 14 && street_number) {
+      try {
+        const unit = await pickUnitRCFromList(rc14, String(street_number).trim());
+        if (unit) refcat = unit; // RC20
+      } catch (e) {
+        console.warn("[by-coords] pickUnitRCFromList error:", e?.message || e);
+      }
+    }
+
+    // 3) Si enrich=1 → intento best-effort de DNPRC (timeout corto). No bloquea el retorno básico.
+    let enrichData = null;
+    if (String(enrich || "") === "1") {
+      const tryDNPRC = async (prov, mun, to = 8000) => {
+        const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC");
+        url.searchParams.set("Provincia", prov ?? "");
+        url.searchParams.set("Municipio", mun ?? "");
+        url.searchParams.set("RC", refcat);
+        try {
+          const rr = await axiosGetTxt(url.toString(), { timeout: to, retries: 1 });
+          if (rr.status >= 200 && rr.status < 300 && typeof rr.data === "string") {
+            const o = xmlParser.parse(rr.data);
+            const tipoVia = findFirst(o, "tv");
+            let via       = findFirst(o, "nv");
+            let numero    = findFirst(o, "pnp");
+            const cp      = findFirst(o, "pc");
+            const uso     = findFirst(o, "luso") || findFirst(o, "uso");
+            const sfc     = toNum(findFirst(o, "sfc"));
+            const ant     = findFirst(o, "ant");
+
+            // Relleno suave con label si faltan via/numero
+            if ((!via || !numero) && label) {
+              const m = label.match(/^\s*(?:CL|AV|PS|PL|CR|CTRA|CM|RD|TRV|C\/|AV\.)?\s*([A-Z0-9ÁÉÍÓÚÑ\s]+?)\s+(\d+[A-Z]?)\b/i);
+              if (m) {
+                if (!via) via = m[1].trim();
+                if (!numero) numero = m[2].trim();
+              }
+            }
+
+            return {
+              ok: true,
+              direccion: {
+                tipo_via: tipoVia || null,
+                via: via || null,
+                numero: numero || null,
+                cp: cp || null,
+              },
+              uso: uso || null,
+              superficie_construida_m2: sfc,
+              anio_construccion: ant || null,
+            };
+          }
+        } catch (e) {
+          // silencioso; es best-effort
+        }
+        return { ok: false };
+      };
+
+      // 3.a) Primero sin provincia/municipio (muchas veces resuelve igual)
+      let dn = await tryDNPRC("", "", 8000);
+
+      // 3.b) Si falla, intenta deducir municipio/provincia desde label: "… MUNICIPIO (PROVINCIA)"
+      if (!dn.ok && label) {
+        const m = label.match(/\s+([A-ZÁÉÍÓÚÑ\s]+)\s+\(([A-ZÁÉÍÓÚÑ\s]+)\)\s*$/i);
+        if (m) {
+          const prov = stripAccentsUpper(m[2]);
+          const mun  = stripAccentsUpper(m[1]);
+          dn = await tryDNPRC(prov, mun, 8000);
+        }
+      }
+
+      if (dn.ok) {
+        enrichData = dn;
+      }
+    }
+
+    // 4) Respuesta
     return res.json({
       ok: true,
       buildingId: idBU(rc14),
       addressId: idAD(rc14),
       rc14,
+      refcat,               // puede ser RC14 o RC20 si hubo match por puerta
       label,
-      photoUrl: null
+      photoUrl: null,
+      ...(enrichData ? {
+        direccion: enrichData.direccion,
+        uso: enrichData.uso,
+        superficie_construida_m2: enrichData.superficie_construida_m2,
+        anio_construccion: enrichData.anio_construccion
+      } : {})
     });
   } catch (e) {
     console.error("[addresses/by-coords] error:", e?.message || e);
