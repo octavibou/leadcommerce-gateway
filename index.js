@@ -20,8 +20,8 @@ app.get("/health", (_req, res) => res.json({ ok: true, service: "gateway" }));
 app.get("/catastro/ping", (_req, res) => res.json({ ok: true, service: "catastro" }));
 
 /* -------------------- HTTP Agents + Headers -------------------- */
-const httpsAgent = new https.Agent({ keepAlive: false, timeout: 25000 });
-const httpAgent  = new http.Agent({  keepAlive: false, timeout: 25000 });
+const httpsAgent = new https.Agent({ keepAlive: true, timeout: 45000 });
+const httpAgent  = new http.Agent({  keepAlive: true, timeout: 45000 });
 
 const CAT_HEADERS = {
   Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
@@ -86,15 +86,31 @@ const findFirst = (obj, key) => {
   return null;
 };
 
-const axiosGetTxt = (url) =>
-  axios.get(url, {
-    headers: CAT_HEADERS,
-    responseType: "text",
-    validateStatus: () => true,
-    timeout: 25000,
-    httpsAgent,
-    httpAgent,
-  });
+/* ---------- Axios GET con reintentos/backoff ---------- */
+async function axiosGetTxt(url) {
+  const MAX_TRIES = 3;
+  let lastErr = null;
+  for (let i = 0; i < MAX_TRIES; i++) {
+    try {
+      const r = await axios.get(url, {
+        headers: CAT_HEADERS,
+        responseType: "text",
+        validateStatus: () => true,
+        timeout: 45000,
+        httpsAgent,
+        httpAgent,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+      });
+      return r;
+    } catch (e) {
+      lastErr = e;
+      const sleep = 500 * Math.pow(2, i); // 0.5s, 1s, 2s
+      await new Promise(res => setTimeout(res, sleep));
+    }
+  }
+  throw lastErr;
+}
 
 /* ---------- Scraper OVCListaBienes → RC de unidad por nº puerta ---------- */
 async function pickUnitRCFromList(parcelRC, desiredNumber) {
@@ -152,7 +168,7 @@ const addressFromLdt = (ldt) => {
 };
 
 /* ==================================================================
-   MOCK building (lo mantengo tal cual lo tenías)
+   MOCK building
    ================================================================== */
 app.get("/catastro/building/:rc", async (req, res) => {
   const { rc } = req.params;
@@ -200,7 +216,7 @@ app.get("/catastro/rc", async (req, res) => {
 });
 
 /* ==================================================================
-   /catastro/full → JSON enriquecido (PRIORIDAD DIRECCIÓN + fallback coords)
+   /catastro/full → JSON enriquecido (PRIORIDAD DIRECCIÓN + atajo by-coords/rc14)
    ================================================================== */
 app.get("/catastro/full", async (req, res) => {
   try {
@@ -208,17 +224,17 @@ app.get("/catastro/full", async (req, res) => {
       lat, lng,
       street, street_number, postal_code,
       municipality_name, province_name,
-      debug,
+      prefer, rc14: rc14Param, debug,
     } = req.query;
 
     if (!lat || !lng)
       return res.status(400).json({ ok: false, error: "lat & lng required" });
 
-    // Nombres normalizados (para DNPLOC/DNPPPLOC/DNPRC)
+    // Normalización
     const provNorm = cleanProvinceName(province_name);
     const munNorm  = cleanMunicipalityName(municipality_name);
 
-    // 0) DNPLOC → INE (opcional)
+    // DNPLOC → INE (opcional)
     let provincia_ine = null, municipio_ine = null;
     if (provNorm && munNorm) {
       try {
@@ -228,8 +244,8 @@ app.get("/catastro/full", async (req, res) => {
         const rLoc = await axiosGetTxt(dnploc.toString());
         if (rLoc.status >= 200 && rLoc.status < 300 && typeof rLoc.data === "string") {
           const obj = xmlParser.parse(rLoc.data);
-          const cp = findFirst(obj, "cp"); // "08"
-          const cm = findFirst(obj, "cm"); // "019"
+          const cp = findFirst(obj, "cp");
+          const cm = findFirst(obj, "cm");
           if (cp) provincia_ine = normalizeProvinciaCode(cp);
           if (cm) municipio_ine = String(cm).padStart(3, "0");
         }
@@ -238,7 +254,7 @@ app.get("/catastro/full", async (req, res) => {
       }
     }
 
-    // Helpers para resolución
+    // Helpers resolución
     const tryRcFromCoords = async (LAT, LNG) => {
       try {
         const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR");
@@ -267,11 +283,10 @@ app.get("/catastro/full", async (req, res) => {
 
     const tryRcFromAddress = async () => {
       if (!(provNorm && munNorm && street && street_number)) return { ok:false };
-      // Usamos DNPPPLOC (Provincia, Municipio, NombreVia, Numero). TipoVia vacío para que haga matching laxa.
       const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPPPLOC");
       url.searchParams.set("Provincia", provNorm);
       url.searchParams.set("Municipio", munNorm);
-      url.searchParams.set("TipoVia", ""); // si conoces "CL", "AV", etc., puedes colocarlo
+      url.searchParams.set("TipoVia", "");
       url.searchParams.set("NombreVia", stripAccentsUpper(street));
       url.searchParams.set("Numero", String(street_number));
       const r = await axiosGetTxt(url.toString());
@@ -281,7 +296,6 @@ app.get("/catastro/full", async (req, res) => {
         const pc1  = findFirst(obj, "pc1");
         const pc2  = findFirst(obj, "pc2");
         const rc14 = rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null);
-        // Extra pistas desde DNPPPLOC
         const municipio = findFirst(obj, "nm") || null;
         const provincia = findFirst(obj, "np") || null;
         const ldt = findFirst(obj, "ldt") || null;
@@ -290,20 +304,41 @@ app.get("/catastro/full", async (req, res) => {
       return { ok:false };
     };
 
-    // 1) PRIORIDAD: dirección → RC
-    let rc14 = null, rccoorRawXml = null, obj1 = null, municipio = null, provincia = null, ldt = null;
+    // 1) Inicialización
+    let rc14 = rc14Param || null, rccoorRawXml = null, obj1 = null, municipio = null, provincia = null, ldt = null;
 
-    const adr = await tryRcFromAddress();
-    if (adr.ok) {
-      rc14 = adr.rc14;
-      obj1 = adr.obj;
-      rccoorRawXml = adr.rawXml; // guardamos por simetría (aunque sea de DNPPPLOC)
-      municipio = adr.municipio || municipio;
-      provincia = adr.provincia || provincia;
-      ldt = adr.ldt || ldt;
+    // 2) PRIORIDAD: si llega rc14 → úsalo directo
+    if (!rc14) {
+      // Dirección primero
+      const adr = await tryRcFromAddress();
+      if (adr.ok) {
+        rc14 = adr.rc14;
+        obj1 = adr.obj;
+        rccoorRawXml = adr.rawXml;
+        municipio = adr.municipio || municipio;
+        provincia = adr.provincia || provincia;
+        ldt = adr.ldt || ldt;
+      }
     }
 
-    // 2) Fallback: coords → RC (con pequeño jitter)
+    // 3) Si prefer=bycoords o aún no hay rc14 → usa atajo interno estable
+    if (!rc14 && prefer === "bycoords") {
+      try {
+        const self = `${req.protocol}://${req.get("host")}`;
+        const byc = await axios.get(`${self}/catalog/v1/addresses/by-coords`, {
+          params: { lat, lng },
+          timeout: 15000
+        });
+        if (byc?.data?.ok && byc?.data?.rc14) {
+          rc14 = byc.data.rc14;
+          ldt = byc.data.label || ldt;
+        }
+      } catch (e) {
+        console.warn("[full] prefer=bycoords fallback failed:", e?.message || e);
+      }
+    }
+
+    // 4) Fallback final: RCCOOR con jitter
     if (!rc14) {
       const baseLat = Number(lat);
       const baseLng = Number(lng);
@@ -330,24 +365,6 @@ app.get("/catastro/full", async (req, res) => {
       }
     }
 
-    // Internal fallback: reuse our own by-coords endpoint if direct calls failed
-    if (!rc14) {
-      try {
-        const self = `${req.protocol}://${req.get("host")}`;
-        const byc = await axios.get(`${self}/catalog/v1/addresses/by-coords`, {
-          params: { lat, lng },
-          timeout: 15000
-        });
-        if (byc?.data?.ok && byc?.data?.rc14) {
-          rc14 = byc.data.rc14;
-          // populate minimal context from that path
-          ldt = byc.data.label || ldt;
-        }
-      } catch (e) {
-        console.warn("[full] internal fallback /addresses/by-coords failed:", e?.message || e);
-      }
-    }
-
     if (!rc14) {
       return res.json({
         ok: true,
@@ -357,7 +374,7 @@ app.get("/catastro/full", async (req, res) => {
       });
     }
 
-    // Tenemos RC14. Si hay número, intenta RC20 (unidad)
+    // RC base y posible RC20
     let refcatBase = rc14;
     let refcat = refcatBase;
     if (refcatBase.length === 14 && street_number) {
@@ -365,7 +382,7 @@ app.get("/catastro/full", async (req, res) => {
       if (unit) refcat = unit;
     }
 
-    // 3) DNPRC – cascade de intentos para datos ricos
+    // 5) DNPRC para datos ricos
     const dnprcTry = async (prov, mun) => {
       const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC");
       url.searchParams.set("Provincia", prov ?? "");
@@ -412,7 +429,7 @@ app.get("/catastro/full", async (req, res) => {
       const sfc     = toNum(findFirst(o2, "sfc"));
       const ant     = findFirst(o2, "ant");
 
-      // Rellenos suaves desde ldt/inputs
+      // Rellenos suaves
       if ((!via || !numero) && ldt) {
         const m = ldt.match(/^\s*(?:CL|AV|PS|PL|CR|CTRA|CM|RD|TRV|C\/|AV\.)?\s*([A-Z0-9ÁÉÍÓÚÑ\s]+?)\s+(\d+[A-Z]?)\b/i);
         if (m) {
@@ -476,7 +493,7 @@ app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
     if (!lat || !lng) return res.status(400).json({ ok:false, error:"lat & lng required" });
 
     const self = `${req.protocol}://${req.get("host")}`;
-    const r = await axios.get(`${self}/catastro/rc`, { params: { lat, lng }, responseType: "text", timeout: 15000 });
+    const r = await axios.get(`${self}/catastro/rc`, { params: { lat, lng }, responseType: "text", timeout: 20000 });
 
     const xml = r.data;
     const obj = xmlParser.parse(xml);
@@ -528,7 +545,7 @@ app.get("/catalog/v1/addresses/:id/units", async (req, res) => {
   }
 });
 
-// 3) Foto del address (placeholder de momento)
+// 3) Foto del address (placeholder)
 app.get("/catalog/v1/addresses/:id/photo", async (_req, res) => {
   return res.json({ ok:true, photoUrl: null });
 });
