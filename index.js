@@ -200,14 +200,8 @@ app.get("/catastro/rc", async (req, res) => {
 });
 
 /* ==================================================================
-   /catastro/full → JSON enriquecido (Mapbox inputs opcionales)
+   /catastro/full → JSON enriquecido (con jitter + fallback por dirección)
    ================================================================== */
-// Ejemplo:
-// /catastro/full?lat=41.57865&lng=2.489898
-//   &street=Carrer%20Dels%20Bessots&street_number=3
-//   &postal_code=08392
-//   &municipality_name=Sant%20Andreu%20de%20Llavaneres
-//   &province_name=Barcelona
 app.get("/catastro/full", async (req, res) => {
   try {
     const {
@@ -244,48 +238,95 @@ app.get("/catastro/full", async (req, res) => {
       }
     }
 
-    // 2) RCCOOR → RC (parcela o unidad)
-    const rccoor = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR");
-    rccoor.searchParams.set("SRS", "EPSG:4326");
-    rccoor.searchParams.set("Coordenada_X", String(lng));
-    rccoor.searchParams.set("Coordenada_Y", String(lat));
+    // 2) Intento robusto para resolver RC: RCCOOR + jitter; si falla, DNPPPLOC por dirección
+    const tryRcFromCoords = async (LAT, LNG) => {
+      const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCoordenadas.asmx/Consulta_RCCOOR");
+      url.searchParams.set("SRS", "EPSG:4326");
+      url.searchParams.set("Coordenada_X", String(LNG));
+      url.searchParams.set("Coordenada_Y", String(LAT));
+      const r = await axiosGetTxt(url.toString());
+      if (r.status >= 200 && r.status < 300 && typeof r.data === "string") {
+        const obj = xmlParser.parse(r.data);
+        const rc  = findFirst(obj, "rc");
+        const pc1 = findFirst(obj, "pc1");
+        const pc2 = findFirst(obj, "pc2");
+        return {
+          ok: !!(rc || (pc1 && pc2)),
+          rc14: rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null),
+          rawXml: r.data,
+          obj
+        };
+      }
+      return { ok: false };
+    };
 
-    const r1 = await axiosGetTxt(rccoor.toString());
-    if (!(r1.status >= 200 && r1.status < 300) || typeof r1.data !== "string") {
-      return res.status(502).json({ ok: false, step: "rccoor", status: r1.status, error: "catastro_bad_response" });
+    const baseLat = Number(lat);
+    const baseLng = Number(lng);
+    const deltas = [
+      [0, 0],
+      [0.00025, 0],
+      [-0.00025, 0],
+      [0, 0.00025],
+      [0, -0.00025],
+    ];
+
+    let rc14 = null, rccoorRawXml = null, obj1 = null, municipio = null, provincia = null, ldt = null;
+    for (const [dlat, dlng] of deltas) {
+      const tr = await tryRcFromCoords(baseLat + dlat, baseLng + dlng);
+      if (tr.ok && tr.rc14) {
+        rc14 = tr.rc14;
+        rccoorRawXml = tr.rawXml;
+        obj1 = tr.obj;
+        break;
+      }
     }
 
-    const rawXml = r1.data;
-    const obj1   = xmlParser.parse(rawXml);
+    if (obj1) {
+      municipio = findFirst(obj1, "nm");
+      provincia = findFirst(obj1, "np");
+      ldt = findFirst(obj1, "ldt") || (rccoorRawXml.match(/<ldt>([^<]+)<\/ldt>/i)?.[1]?.trim() || null);
+    }
 
-    const rc     = findFirst(obj1, "rc");   // si ya viene unidad
-    const pc1    = findFirst(obj1, "pc1");  // parcela
-    const pc2    = findFirst(obj1, "pc2");  // parcela
-    let municipio = findFirst(obj1, "nm");
-    let provincia = findFirst(obj1, "np");
+    if (!rc14 && provNorm && munNorm && street && street_number) {
+      const dnppploc = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPPPLOC");
+      dnppploc.searchParams.set("Provincia", provNorm);
+      dnppploc.searchParams.set("Municipio", munNorm);
+      dnppploc.searchParams.set("TipoVia", ""); // si conoces "CL", "AV", etc., ponlo
+      dnppploc.searchParams.set("NombreVia", stripAccentsUpper(street));
+      dnppploc.searchParams.set("Numero", String(street_number));
 
-    // ldt como pista de dirección (CL VIA 106 MUNICIPIO (PROVINCIA))
-    const ldt = findFirst(obj1, "ldt") || (rawXml.match(/<ldt>([^<]+)<\/ldt>/i)?.[1]?.trim() || null);
+      const rAddr = await axiosGetTxt(dnppploc.toString());
+      if (rAddr.status >= 200 && rAddr.status < 300 && typeof rAddr.data === "string") {
+        const objA = xmlParser.parse(rAddr.data);
+        const rc   = findFirst(objA, "rc");
+        const pc1  = findFirst(objA, "pc1");
+        const pc2  = findFirst(objA, "pc2");
+        rc14 = rc ? String(rc).slice(0,14) : (pc1 && pc2 ? `${pc1}${pc2}` : null);
 
-    // RC base
-    let refcatBase = rc ? String(rc) : (pc1 && pc2 ? `${pc1}${pc2}` : null);
-    if (!refcatBase) {
+        if (!municipio) municipio = findFirst(objA, "nm") || municipio;
+        if (!provincia) provincia = findFirst(objA, "np") || provincia;
+        if (!ldt) ldt = findFirst(objA, "ldt") || ldt;
+      }
+    }
+
+    if (!rc14) {
       return res.json({
         ok: true,
         status: "not_found",
         step: "coords_to_rc",
-        ...(debug ? { debug: { rccoorSample: rawXml.slice(0,400) } } : {}),
+        ...(debug ? { debug: { rccoorSample: "no_rc_from_coords_and_addr" } } : {}),
       });
     }
 
-    // Si es parcela (14) y tenemos número → intentar unidad (20)
+    // Tenemos RC14. Si hay número, intenta RC20 (unidad)
+    let refcatBase = rc14;
     let refcat = refcatBase;
     if (refcatBase.length === 14 && street_number) {
       const unit = await pickUnitRCFromList(refcatBase, String(street_number));
-      if (unit) refcat = unit; // ej. 6681310DF4968S0001MQ
+      if (unit) refcat = unit; // p.ej. 6681310DF4968S0001MQ
     }
 
-    // 3) DNPRC – cascade de intentos
+    // 3) DNPRC – cascade de intentos para datos ricos
     const dnprcTry = async (prov, mun) => {
       const url = new URL("https://ovc.catastro.meh.es/OVCServWeb/OVCSWLocalizacionRC/OVCCallejero.asmx/Consulta_DNPRC");
       url.searchParams.set("Provincia", prov ?? "");
@@ -301,19 +342,14 @@ app.get("/catastro/full", async (req, res) => {
     const provRccoor = provincia ? stripAccentsUpper(provincia) : null;
     const munRccoor  = municipio ? stripAccentsUpper(municipio) : null;
 
-    // (1) Mapbox normalizado
     let r2 = await dnprcTry(cleanProvinceName(province_name), cleanMunicipalityName(municipality_name));
-    // (2) RCCOOR nombres
     if (!r2.ok) r2 = await dnprcTry(provRccoor, munRccoor);
-    // (3) Nombres desde ldt
     if (!r2.ok && ldt) {
       const m = ldt.match(/\s+([A-ZÁÉÍÓÚÑ\s]+)\s+\(([A-ZÁÉÍÓÚÑ\s]+)\)\s*$/i);
       if (m) r2 = await dnprcTry(stripAccentsUpper(m[2]), stripAccentsUpper(m[1]));
     }
-    // (4) Vacíos – algunas instancias aceptan RC solo
     if (!r2.ok) r2 = await dnprcTry("", "");
 
-    // Provincia/Municipio a reportar
     const provinciaOut = provincia || cleanProvinceName(province_name) || null;
     const municipioOut = municipio || cleanMunicipalityName(municipality_name) || null;
 
@@ -324,7 +360,7 @@ app.get("/catastro/full", async (req, res) => {
       municipio: municipioOut,
       provincia_ine: provincia_ine,
       municipio_ine: municipio_ine,
-      ...(debug ? { debug: { ldt, rccoorSample: rawXml.slice(0, 400) } } : {}),
+      ...(debug ? { debug: { ldt, rccoorSample: rccoorRawXml ? rccoorRawXml.slice(0, 400) : null } } : {}),
     };
 
     if (r2.ok) {
@@ -337,7 +373,6 @@ app.get("/catastro/full", async (req, res) => {
       const sfc     = toNum(findFirst(o2, "sfc"));
       const ant     = findFirst(o2, "ant");
 
-      // Rellenos suaves desde ldt/Mapbox
       if ((!via || !numero) && ldt) {
         const m = ldt.match(/^\s*(?:CL|AV|PS|PL|CR|CTRA|CM|RD|TRV|C\/|AV\.)?\s*([A-Z0-9ÁÉÍÓÚÑ\s]+?)\s+(\d+[A-Z]?)\b/i);
         if (m) {
@@ -372,8 +407,7 @@ app.get("/catastro/full", async (req, res) => {
       superficie_construida_m2: null,
       anio_construccion: null,
       note: "dnprc_failed",
-      dnprc_status: r2.status,
-      ...(debug ? { debug: { dnprcSample: String(r2.data || "").slice(0, 400) } } : {}),
+      ...(debug ? { debug: { dnprcSample: null } } : {}),
     });
   } catch (e) {
     console.error("catastro/full error:", e?.message || e);
@@ -396,13 +430,11 @@ app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
     const { lat, lng } = req.query;
     if (!lat || !lng) return res.status(400).json({ ok:false, error:"lat & lng required" });
 
-    // Llamamos a /catastro/rc (XML)
     const self = `${req.protocol}://${req.get("host")}`;
     const r = await axios.get(`${self}/catastro/rc`, { params: { lat, lng }, responseType: "text", timeout: 15000 });
 
     const xml = r.data;
     const obj = xmlParser.parse(xml);
-    // Buscamos rc o, si no, pc1+pc2
     const rc = findFirst(obj, "rc");
     const pc1 = findFirst(obj, "pc1");
     const pc2 = findFirst(obj, "pc2");
@@ -452,7 +484,7 @@ app.get("/catalog/v1/addresses/:id/units", async (req, res) => {
 });
 
 // 3) Foto del address (placeholder de momento)
-app.get("/catalog/v1/addresses/:id/photo", async (req, res) => {
+app.get("/catalog/v1/addresses/:id/photo", async (_req, res) => {
   return res.json({ ok:true, photoUrl: null });
 });
 
