@@ -190,6 +190,95 @@ app.get("/catastro/building/:rc", async (req, res) => {
   });
 });
 
+/* ---------- Geo (WFS) helpers: fetch parcela geometry + centroid ---------- */
+async function fetchParcelGeoJSON(refcat) {
+  try {
+    if (!refcat) return null;
+    const rc14 = toRC14(refcat);
+    if (!rc14) return null;
+
+    const wfs = new URL("https://ovc.catastro.meh.es/Cartografia/WMS/ServidorWMS.aspx");
+    wfs.searchParams.set("SERVICE", "WFS");
+    wfs.searchParams.set("REQUEST", "GetFeature");
+    wfs.searchParams.set("VERSION", "1.1.0");
+    wfs.searchParams.set("TYPENAME", "catastro:parcelas");
+    wfs.searchParams.set("SRSNAME", "EPSG:4326");
+    wfs.searchParams.set("outputFormat", "application/json");
+    wfs.searchParams.set("CQL_FILTER", `refcat='${rc14}'`);
+
+    const r = await axios.get(wfs.toString(), {
+      headers: { Accept: "application/json" },
+      timeout: 20000,
+      httpsAgent,
+      httpAgent,
+      validateStatus: () => true
+    });
+
+    if (r.status >= 200 && r.status < 300 && r.data && r.data.features && r.data.features.length) {
+      return r.data.features[0].geometry || null;
+    }
+    return null;
+  } catch (e) {
+    console.warn("[fetchParcelGeoJSON] error:", e?.message || e);
+    return null;
+  }
+}
+
+function centroidOfRing(ring) {
+  // ring: [[lng,lat], ...] (closed or open)
+  if (!Array.isArray(ring) || ring.length < 3) return null;
+  let area = 0, cx = 0, cy = 0;
+  const n = ring[0][0] === ring[ring.length - 1][0] && ring[0][1] === ring[ring.length - 1][1]
+    ? ring.length - 1
+    : ring.length;
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[(i + 1) % n];
+    const a = x1 * y2 - x2 * y1;
+    area += a;
+    cx += (x1 + x2) * a;
+    cy += (y1 + y2) * a;
+  }
+  area *= 0.5;
+  if (Math.abs(area) < 1e-12) {
+    // fallback: simple average if degenerate
+    const acc = ring.slice(0, n).reduce((p, [x, y]) => [p[0] + x, p[1] + y], [0, 0]);
+    return { lng: acc[0] / n, lat: acc[1] / n };
+  }
+  return { lng: cx / (6 * area), lat: cy / (6 * area) };
+}
+
+function centroidOfGeometry(geometry) {
+  if (!geometry) return null;
+  if (geometry.type === "Polygon" && Array.isArray(geometry.coordinates) && geometry.coordinates.length) {
+    return centroidOfRing(geometry.coordinates[0]);
+  }
+  if (geometry.type === "MultiPolygon" && Array.isArray(geometry.coordinates) && geometry.coordinates.length) {
+    // take largest outer ring by absolute area
+    let best = null;
+    let bestAbsArea = -1;
+    for (const poly of geometry.coordinates) {
+      if (!poly || !poly[0]) continue;
+      const ring = poly[0];
+      // compute absolute area quickly
+      let area = 0;
+      const n = ring.length;
+      for (let i = 0; i < n - 1; i++) {
+        const [x1, y1] = ring[i];
+        const [x2, y2] = ring[i + 1];
+        area += x1 * y2 - x2 * y1;
+      }
+      const absA = Math.abs(area * 0.5);
+      if (absA > bestAbsArea) {
+        bestAbsArea = absA;
+        best = ring;
+      }
+    }
+    return best ? centroidOfRing(best) : null;
+  }
+  return null;
+}
+
 /* ==================================================================
    /catastro/rc → XML directo por coordenadas
    ================================================================== */
@@ -548,7 +637,7 @@ const idAD = (rc14) => `ES.SDGC.AD.${rc14}`;
 // 1) Buscar “card” por coords
 app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
   try {
-    const { lat, lng, enrich, street_number } = req.query;
+    const { lat, lng, enrich, street_number, snap } = req.query;
     if (!lat || !lng) return res.status(400).json({ ok:false, error:"lat & lng required" });
 
     // 1) Obtener RC14 rápido vía /catastro/rc
@@ -647,6 +736,22 @@ app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
       }
     }
 
+    // 3.bis) Snap opcional a la parcela (centroide) cuando snap=1 o enrich=1
+    let centroidOut = null;
+    if (String(snap || "") === "1" || String(enrich || "") === "1") {
+      try {
+        const geom = await fetchParcelGeoJSON(refcat || rc14);
+        if (geom) {
+          const c = centroidOfGeometry(geom);
+          if (c && Number.isFinite(c.lat) && Number.isFinite(c.lng)) {
+            centroidOut = { lat: c.lat, lng: c.lng };
+          }
+        }
+      } catch (e) {
+        console.warn("[by-coords] snap centroid error:", e?.message || e);
+      }
+    }
+
     // 4) Respuesta
     return res.json({
       ok: true,
@@ -656,6 +761,7 @@ app.get("/catalog/v1/addresses/by-coords", async (req, res) => {
       refcat,               // puede ser RC14 o RC20 si hubo match por puerta
       label,
       photoUrl: null,
+      ...(centroidOut ? { centroid: centroidOut } : {}),
       ...(enrichData ? {
         direccion: enrichData.direccion,
         uso: enrichData.uso,
